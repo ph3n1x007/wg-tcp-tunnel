@@ -104,6 +104,64 @@ order to automatically install the "wg-tcp-tunnel" service, configure the
 project with `-DENABLE_RUNIT=ON`. For `wg-tcp-tunnel` command line arguments
 customization use the `-DWGTT_RUNIT_ARGS="..."` option.
 
+### Through an HTTP proxy
+
+When the client side sits behind a corporate HTTP proxy (all outbound TCP
+must be tunneled via `CONNECT`), pass `--proxy=HOST:PORT` plus the auth
+options. The server side is unchanged — it only ever sees the TCP that the
+proxy forwards.
+
+| Option | Purpose |
+|---|---|
+| `--proxy=HOST:PORT` | The corporate proxy. HOST may be an FQDN or IP. |
+| `--proxy-auth=none\|basic\|ntlm\|negotiate` | Auth scheme. `negotiate` prefers Kerberos and falls back to NTLM. `ntlm` and `negotiate` require Windows (SSPI). |
+| `--proxy-user=DOMAIN\user` | Username. Optional for `negotiate`/`ntlm` — if omitted, the current Windows logon is used (this is what enables Kerberos SSO). |
+| `--proxy-pass=...` | Password. Use `ENV:VAR` to read from an environment variable, e.g. `--proxy-pass=ENV:WG_PROXY_PASS`. |
+| `--proxy-spn=HTTP/proxy.fqdn` | Override the Kerberos SPN. Default is `HTTP/<--proxy host>`. |
+| `--dst-tcp-host=HOST:PORT` | Use an FQDN as the CONNECT target (rather than `--dst-tcp`'s IP), so the proxy resolves it. Required when the destination host does not have a usable A record from the *client's* DNS but does have one from the proxy's. |
+
+Examples (Windows client):
+
+```cmd
+:: Kerberos SSO — uses your current logon, no password to type
+wg-tcp-tunnel.exe ^
+    --src-udp=127.0.0.1:51822 ^
+    --dst-tcp-host=vps.example.com:443 ^
+    --proxy=corp-proxy.intra:8080 ^
+    --proxy-auth=negotiate
+
+:: NTLM with explicit credentials
+set WG_PROXY_PASS=hunter2
+wg-tcp-tunnel.exe ^
+    --src-udp=127.0.0.1:51822 ^
+    --dst-tcp-host=vps.example.com:443 ^
+    --proxy=corp-proxy.intra:8080 ^
+    --proxy-auth=ntlm ^
+    --proxy-user=CORP\jdoe ^
+    --proxy-pass=ENV:WG_PROXY_PASS
+
+:: Basic auth (works on any platform)
+wg-tcp-tunnel.exe ^
+    --src-udp=127.0.0.1:51822 ^
+    --dst-tcp=203.0.113.10:80 ^
+    --proxy=corp-proxy.intra:3128 ^
+    --proxy-auth=basic ^
+    --proxy-user=jdoe ^
+    --proxy-pass=ENV:WG_PROXY_PASS
+```
+
+Notes:
+
+* WireGuard already encrypts and authenticates the inner traffic, so an
+  HTTP-only (port 80) endpoint is functionally just as private as one
+  fronted by TLS — but TLS-fronted endpoints (port 443) are far more likely
+  to traverse strict proxies that whitelist `CONNECT` targets to 443.
+* The CONNECT handshake reuses the same TCP socket across all 407
+  challenge/response rounds, as required by NTLM and Negotiate. If the
+  proxy closes the connection mid-handshake, the auth is not recoverable
+  and the client will retry from scratch.
+* The `Proxy-Authorization` header is not logged at any verbosity.
+
 ## License
 
 This project is licensed under the MIT license. See the [LICENSE](LICENSE) file

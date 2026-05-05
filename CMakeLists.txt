@@ -41,12 +41,23 @@ endif()
 
 find_package(Boost 1.40.0 REQUIRED COMPONENTS log log_setup program_options)
 
-add_executable(wg-tcp-tunnel src/main.cpp src/tcp2udp.cpp src/udp2tcp.cpp)
+add_executable(wg-tcp-tunnel
+	src/main.cpp
+	src/tcp2udp.cpp
+	src/udp2tcp.cpp
+	src/proxy_auth_basic.cpp
+	src/proxy_connect.cpp)
 target_compile_features(wg-tcp-tunnel PRIVATE cxx_std_17)
 
 target_link_libraries(wg-tcp-tunnel PRIVATE Boost::log)
 target_link_libraries(wg-tcp-tunnel PRIVATE Boost::log_setup)
 target_link_libraries(wg-tcp-tunnel PRIVATE Boost::program_options)
+
+if(WIN32)
+	# SSPI-backed NTLM and Negotiate (Kerberos) for HTTP CONNECT proxy auth.
+	target_sources(wg-tcp-tunnel PRIVATE src/proxy_auth_sspi.cpp)
+	target_link_libraries(wg-tcp-tunnel PRIVATE Secur32)
+endif()
 
 if(ENABLE_NGROK)
 	find_package(OpenSSL REQUIRED)

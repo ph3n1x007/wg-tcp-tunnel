@@ -2,10 +2,12 @@
 // SPDX-FileCopyrightText: 2023-2025 Arkadiusz Bokowy and contributors
 // SPDX-License-Identifier: MIT
 
+#include <cctype>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <boost/asio.hpp>
@@ -16,6 +18,8 @@
 #include <boost/program_options.hpp>
 
 #include "ngrok.h"
+#include "proxy_auth.h"
+#include "proxy_connect.h"
 #include "tcp2udp.h"
 #include "udp2tcp.h"
 #include "utils.hpp"
@@ -119,6 +123,30 @@ auto main(int argc, char * argv[]) -> int {
 	o_builder("tcp-keep-alive", po::value(&tcp_keep_alive)->implicit_value(120),
 	          "enable TCP keep-alive on TCP socket(s) optionally specifying the keep-alive "
 	          "idle time in seconds");
+
+	std::string proxy_addr;
+	std::string proxy_auth_scheme;
+	std::string proxy_user;
+	std::string proxy_pass;
+	std::string proxy_spn;
+	std::string dst_tcp_host;
+	o_builder("proxy", po::value(&proxy_addr),
+	          "route outbound TCP through an HTTP CONNECT proxy at HOST:PORT (HOST may be an "
+	          "FQDN or IP)");
+	o_builder("proxy-auth", po::value(&proxy_auth_scheme)->default_value("none"),
+	          "proxy auth scheme: none, basic, ntlm, negotiate (Windows only for ntlm/negotiate)");
+	o_builder("proxy-user", po::value(&proxy_user),
+	          "proxy username, optionally as 'DOMAIN\\user' or 'user@DOMAIN'; if omitted with "
+	          "ntlm/negotiate, the current Windows logon is used");
+	o_builder("proxy-pass", po::value(&proxy_pass),
+	          "proxy password; prefix with 'ENV:' to read from an environment variable, e.g. "
+	          "'ENV:WG_PROXY_PASS'");
+	o_builder("proxy-spn", po::value(&proxy_spn),
+	          "Kerberos SPN for the proxy (default: 'HTTP/<proxy-host>'); only used with "
+	          "negotiate");
+	o_builder("dst-tcp-host", po::value(&dst_tcp_host),
+	          "destination as HOST:PORT used in CONNECT (lets the proxy resolve the name; "
+	          "required when the destination is an FQDN such as for SNI-based fronting)");
 
 #if ENABLE_WEBSOCKET
 	bool websocket = false;
@@ -229,13 +257,98 @@ auto main(int argc, char * argv[]) -> int {
 #endif
 
 	const bool is_server = ep_src_tcp.port() != 0 && ep_dst_udp.port() != 0;
-	const bool is_client = ep_src_udp.port() != 0 && (ep_dst_tcp.port() != 0 || dynamic_dst_tcp);
+	const bool is_client = ep_src_udp.port() != 0 &&
+	    (ep_dst_tcp.port() != 0 || dynamic_dst_tcp || !dst_tcp_host.empty());
 	if (!is_server && !is_client) {
 		std::cerr << PROJECT_NAME << ": one of "
 		          << "'--src-tcp' && '--dst-udp'"
 		          << " or "
 		          << "'--src-udp' && '--dst-tcp'"
 		          << " must be given" << "\n";
+		return EXIT_FAILURE;
+	}
+
+	wg::proxy::config proxy_cfg;
+	if (!proxy_addr.empty()) {
+		if (!is_client) {
+			std::cerr << PROJECT_NAME << ": '--proxy' is only meaningful in client mode\n";
+			return EXIT_FAILURE;
+		}
+		// Resolve proxy host once at startup. Failure here is fatal — we
+		// have no fallback path for a proxy we can't reach.
+		std::string host;
+		uint16_t port;
+		try {
+			std::tie(host, port) = wg::utils::split_host_port(proxy_addr);
+		} catch (const std::exception & e) {
+			std::cerr << PROJECT_NAME << ": '--proxy' invalid: " << e.what() << "\n";
+			return EXIT_FAILURE;
+		}
+		try {
+			asio::io_context resolve_ioc;
+			asio::ip::tcp::resolver resolver(resolve_ioc);
+			auto results = resolver.resolve(host, std::to_string(port));
+			if (results.empty())
+				throw std::runtime_error("no addresses resolved");
+			proxy_cfg.endpoint = results.begin()->endpoint();
+		} catch (const std::exception & e) {
+			std::cerr << PROJECT_NAME << ": '--proxy' resolve '" << host << "': " << e.what()
+			          << "\n";
+			return EXIT_FAILURE;
+		}
+
+		// CONNECT target string: explicit --dst-tcp-host wins; otherwise
+		// stringify --dst-tcp (which the validator already proved is IP:port).
+		if (!dst_tcp_host.empty())
+			proxy_cfg.target = dst_tcp_host;
+		else
+			proxy_cfg.target =
+			    ep_dst_tcp.address().to_string() + ":" + std::to_string(ep_dst_tcp.port());
+
+		// Resolve the password env-var redirect, matching the ngrok-api-key pattern.
+		if (proxy_pass.substr(0, 4) == "ENV:") {
+			const auto v = std::getenv(proxy_pass.substr(4).c_str());
+			proxy_pass = v != nullptr ? v : "";
+		}
+
+		std::string scheme_lc = proxy_auth_scheme;
+		for (auto & c : scheme_lc)
+			c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+		if (scheme_lc == "none") {
+			// no factory
+		} else if (scheme_lc == "basic") {
+			if (proxy_user.empty()) {
+				std::cerr << PROJECT_NAME << ": '--proxy-auth=basic' requires '--proxy-user'\n";
+				return EXIT_FAILURE;
+			}
+			std::string user_pass = proxy_user + ":" + proxy_pass;
+			proxy_cfg.make_auth = [user_pass]() {
+				return wg::proxy::make_basic_provider(user_pass);
+			};
+		} else if (scheme_lc == "ntlm" || scheme_lc == "negotiate") {
+#ifdef _WIN32
+			std::string scheme_name = (scheme_lc == "ntlm") ? "NTLM" : "Negotiate";
+			std::string spn = proxy_spn.empty() ? ("HTTP/" + host) : proxy_spn;
+			std::string user = proxy_user;
+			std::string pass = proxy_pass;
+			proxy_cfg.make_auth = [scheme_name, spn, user, pass]() {
+				return wg::proxy::make_sspi_provider(scheme_name, spn, user, pass);
+			};
+#else
+			std::cerr << PROJECT_NAME
+			          << ": '--proxy-auth=" << scheme_lc << "' requires Windows (SSPI)\n";
+			return EXIT_FAILURE;
+#endif
+		} else {
+			std::cerr << PROJECT_NAME << ": invalid '--proxy-auth' value: " << proxy_auth_scheme
+			          << "\n";
+			return EXIT_FAILURE;
+		}
+	} else if (!proxy_user.empty() || !proxy_pass.empty() || !proxy_spn.empty() ||
+	           proxy_auth_scheme != "none" || !dst_tcp_host.empty()) {
+		std::cerr << PROJECT_NAME
+		          << ": '--proxy-*' / '--dst-tcp-host' options require '--proxy'\n";
 		return EXIT_FAILURE;
 	}
 
@@ -253,6 +366,8 @@ auto main(int argc, char * argv[]) -> int {
 
 	tcp2udp.keep_alive_tcp(tcp_keep_alive);
 	udp2tcp.keep_alive_tcp(tcp_keep_alive);
+	if (!proxy_cfg.target.empty())
+		udp2tcp.proxy(std::move(proxy_cfg));
 #if ENABLE_NGROK
 	tcp2udp.keep_alive_app(ngrok_keep_alive);
 	udp2tcp.keep_alive_app(ngrok_keep_alive);

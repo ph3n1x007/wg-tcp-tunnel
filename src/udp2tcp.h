@@ -15,6 +15,7 @@
 #endif
 
 #include "ngrok.h"
+#include "proxy_connect.h"
 #include "utils.hpp"
 
 namespace wg::tunnel {
@@ -48,10 +49,15 @@ public:
 	auto ws_headers(utils::http::headers headers) { m_ws_headers = std::move(headers); }
 #endif
 
+	// Route outbound TCP through an HTTP CONNECT proxy. Pass an empty target
+	// to disable. The factory in cfg is invoked per connect attempt.
+	auto proxy(proxy::config cfg) -> void { m_proxy = std::move(cfg); }
+
 private:
 	auto to_string(bool verbose = false) -> std::string;
 
 	auto do_connect() -> void;
+	auto do_proxy_handshake() -> void;
 	auto do_connect_handler(const boost::system::error_code & ec) -> void;
 
 	auto do_app_keep_alive_init() -> void;
@@ -89,6 +95,10 @@ private:
 	std::array<char, 4096> m_buffer_send;
 	size_t m_buffer_send_length;
 	asio::streambuf m_buffer_recv;
+	// HTTP CONNECT proxy (optional). m_proxy.target empty == disabled.
+	proxy::config m_proxy;
+	proxy::connector m_proxy_connector{ m_socket_tcp_dest };
+	std::unique_ptr<proxy::auth_provider> m_proxy_auth_inflight;
 #if ENABLE_WEBSOCKET
 	ws::stream<asio::ip::tcp::socket &> m_ws{ m_socket_tcp_dest };
 	beast::flat_buffer m_ws_buffer_recv;

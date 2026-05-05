@@ -52,13 +52,50 @@ auto udp2tcp::to_string(bool verbose) -> std::string {
 
 auto udp2tcp::do_connect() -> void {
 	try {
-		m_socket_tcp_dest.async_connect(m_ep_tcp_dest_cache = m_ep_tcp_dest_provider.tcp_dest_ep(),
-		                                [this](const auto & ec) { do_connect_handler(ec); });
+		if (!m_proxy.target.empty()) {
+			// Connect to the proxy first; the CONNECT handshake follows in
+			// do_proxy_handshake() and only then does normal tunnel flow
+			// resume via do_connect_handler.
+			m_ep_tcp_dest_cache = m_proxy.endpoint;
+			LOG(debug) << "connect: via proxy " << utils::to_string(m_proxy.endpoint)
+			           << " to " << m_proxy.target;
+			m_socket_tcp_dest.async_connect(m_proxy.endpoint, [this](const auto & ec) {
+				if (ec) {
+					LOG(error) << "connect: proxy " << utils::to_string(m_proxy.endpoint)
+					           << ": " << ec.message();
+					m_socket_tcp_dest.close();
+					do_send();
+					return;
+				}
+				do_proxy_handshake();
+			});
+		} else {
+			m_socket_tcp_dest.async_connect(
+			    m_ep_tcp_dest_cache = m_ep_tcp_dest_provider.tcp_dest_ep(),
+			    [this](const auto & ec) { do_connect_handler(ec); });
+		}
 	} catch (const std::exception & e) {
 		LOG(error) << "connect: Get destination TCP endpoint: " << e.what();
 		// Handle next UDP packet
 		do_send();
 	}
+}
+
+auto udp2tcp::do_proxy_handshake() -> void {
+	// Build a fresh auth provider for this attempt; SSPI contexts cannot be
+	// reused across handshakes.
+	m_proxy_auth_inflight.reset();
+	try {
+		if (m_proxy.make_auth)
+			m_proxy_auth_inflight = m_proxy.make_auth();
+	} catch (const std::exception & e) {
+		LOG(error) << "proxy auth init failed: " << e.what();
+		m_socket_tcp_dest.close();
+		do_send();
+		return;
+	}
+	m_proxy_connector.start(m_proxy.target, m_proxy_auth_inflight.get(),
+	                        [this](const auto & ec) { do_connect_handler(ec); });
 }
 
 auto udp2tcp::do_connect_handler(const boost::system::error_code & ec) -> void {
